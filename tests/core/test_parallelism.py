@@ -2,7 +2,9 @@ import asyncio
 import dataclasses
 import datetime
 from random import random
-from typing import Any, Callable, Dict, Generator, List, Optional, Tuple, Union
+from typing import Any, AsyncGenerator, Callable, Dict, Generator, List, Optional, Union
+
+import pytest
 
 from burr.common import types as burr_types
 from burr.core import (
@@ -12,75 +14,187 @@ from burr.core import (
     ApplicationGraph,
     State,
     action,
-    expr,
 )
 from burr.core.action import Input, Result
 from burr.core.graph import GraphBuilder
-from burr.core.parallelism import MapActions, MapStates, RunnableGraph
+from burr.core.parallelism import (
+    MapActions,
+    MapActionsAndStates,
+    MapStates,
+    RunnableGraph,
+    SubGraphTask,
+    TaskBasedParallelAction,
+)
 from burr.tracking.base import SyncTrackingClient
 from burr.visibility import ActionSpan
 
 old_action = action
 
 
-@action(reads=["n"], writes=["n_count"])
-def start(state: State) -> State:
-    print("start", state)
-    return state.update(n_count=0)
-
-
-@action(reads=["n"], writes=["n_count", "n"])
-def even(state: State, divisor: int) -> State:
-    print("even", state)
-    result = {"n": state["n"] // divisor}
-    return state.update(**result).increment(n_count=1)
-
-
-@action(reads=["n"], writes=["n_count", "n"])
-def odd(state: State, multiplier: int, adder: int) -> State:
-    print("odd", state)
-    result = {"n": multiplier * state["n"] + adder}
-    return state.update(**result).increment(n_count=1)
-
-
-@action(reads=["n_count", "n"], writes=[])
-def final(state: State) -> Tuple[dict, State]:
-    print("final", state)
-    return {"n_count": state["n_count"], "n": state["n"]}, state
-
-
 async def sleep_random():
     await asyncio.sleep(random())
 
 
-@action(reads=["n"], writes=["n_count"])
-async def astart(state: State) -> State:
+# Single action/callable subgraph
+@action(reads=["input_number", "number_to_add"], writes=["output_number"])
+def simple_single_fn_subgraph(
+    state: State, additional_number: int = 1, identifying_number: int = 1000
+) -> State:
+    return state.update(
+        output_number=state["input_number"]
+        + state["number_to_add"]
+        + additional_number
+        + identifying_number
+    )
+
+
+# Single action/callable subgraph
+@action(reads=["input_number", "number_to_add"], writes=["output_number"])
+async def simple_single_fn_subgraph_async(
+    state: State, additional_number: int = 1, identifying_number: int = 1000
+) -> State:
     await sleep_random()
-    print("start", state)
-    return state.update(n_count=0)
+    return state.update(
+        output_number=state["input_number"]
+        + state["number_to_add"]
+        + additional_number
+        + identifying_number
+    )
 
 
-@action(reads=["n"], writes=["n_count", "n"])
-async def aeven(state: State, divisor: int) -> State:
+class ClassBasedAction(Action):
+    def __init__(self, identifying_number: int, name: str = "class_based_action"):
+        super().__init__()
+        self._name = name
+        self.identifying_number = identifying_number
+
+    @property
+    def reads(self) -> list[str]:
+        return ["input_number", "number_to_add"]
+
+    def run(self, state: State, **run_kwargs) -> dict:
+        return {
+            "output_number": state["input_number"]
+            + state["number_to_add"]
+            + run_kwargs.get("additional_number", 1)
+            + self.identifying_number
+        }
+
+    @property
+    def writes(self) -> list[str]:
+        return ["output_number"]
+
+    def update(self, result: dict, state: State) -> State:
+        return state.update(**result)
+
+
+class ClassBasedActionAsync(ClassBasedAction):
+    async def run(self, state: State, **run_kwargs) -> dict:
+        await sleep_random()
+        return super().run(state, **run_kwargs)
+
+
+@action(reads=["input_number"], writes=["current_number"])
+def entry_action_for_subgraph(state: State) -> State:
+    return state.update(current_number=state["input_number"])
+
+
+@action(reads=["current_number", "number_to_add"], writes=["current_number"])
+def add_number_to_add(state: State) -> State:
+    return state.update(current_number=state["current_number"] + state["number_to_add"])
+
+
+@action(reads=["current_number"], writes=["current_number"])
+def add_additional_number_to_add(
+    state: State, additional_number: int = 1, identifying_number: int = 3000
+) -> State:
+    return state.update(
+        current_number=state["current_number"] + additional_number + identifying_number
+    )  # 1000 is the one that marks this as different
+
+
+@action(reads=["current_number"], writes=["output_number"])
+def final_result(state: State) -> State:
+    return state.update(output_number=state["current_number"])
+
+
+@action(reads=["input_number"], writes=["current_number"])
+async def entry_action_for_subgraph_async(state: State) -> State:
     await sleep_random()
-    print("even", state)
-    result = {"n": state["n"] // divisor}
-    return state.update(**result).increment(n_count=1)
+    return entry_action_for_subgraph(state)
 
 
-@action(reads=["n"], writes=["n_count", "n"])
-async def aodd(state: State, multiplier: int, adder: int) -> State:
+@action(reads=["current_number", "number_to_add"], writes=["current_number"])
+async def add_number_to_add_async(state: State) -> State:
     await sleep_random()
-    print("odd", state)
-    result = {"n": multiplier * state["n"] + adder}
-    return state.update(**result).increment(n_count=1)
+    return add_number_to_add(state)
 
 
-@action(reads=["n_count", "n"], writes=[])
-async def afinal(state: State) -> Tuple[dict, State]:
+@action(reads=["current_number"], writes=["current_number"])
+async def add_additional_number_to_add_async(
+    state: State, additional_number: int = 1, identifying_number: int = 3000
+) -> State:
     await sleep_random()
-    print("final", state)
-    return {"n_count": state["n_count"], "n": state["n"]}, state
+    return add_additional_number_to_add(
+        state, additional_number=additional_number, identifying_number=identifying_number
+    )  # 1000 is the one that marks this as different
+
+
+@action(reads=["current_number"], writes=["output_number"])
+async def final_result_async(state: State) -> State:
+    await sleep_random()
+    return final_result(state)
+
+
+SubGraphType = Union[Action, Callable, RunnableGraph]
+
+
+def create_full_subgraph(identifying_number: int = 0) -> SubGraphType:
+    return RunnableGraph(
+        graph=(
+            GraphBuilder()
+            .with_actions(
+                entry_action_for_subgraph,
+                add_number_to_add,
+                add_additional_number_to_add.bind(identifying_number=identifying_number),
+                final_result,
+            )
+            .with_transitions(
+                ("entry_action_for_subgraph", "add_number_to_add"),
+                ("add_number_to_add", "add_additional_number_to_add"),
+                ("add_additional_number_to_add", "final_result"),
+            )
+            .build()
+        ),
+        entrypoint="entry_action_for_subgraph",
+        halt_after=["final_result"],
+    )
+
+
+def create_full_subgraph_async(identifying_number: int = 0) -> SubGraphType:
+    return RunnableGraph(
+        graph=GraphBuilder()
+        .with_actions(
+            entry_action_for_subgraph=entry_action_for_subgraph_async,
+            add_number_to_add=add_number_to_add_async,
+            add_additional_number_to_add=add_additional_number_to_add_async.bind(
+                identifying_number=identifying_number
+            ),
+            final_result=final_result_async,
+        )
+        .with_transitions(
+            ("entry_action_for_subgraph", "add_number_to_add"),
+            ("add_number_to_add", "add_additional_number_to_add"),
+            ("add_additional_number_to_add", "final_result"),
+        )
+        .build(),
+        entrypoint="entry_action_for_subgraph",
+        halt_after=["final_result"],
+    )
+
+
+FULL_SUBGRAPH: SubGraphType = create_full_subgraph(identifying_number=3000)
+FULL_SUBGRAPH_ASYNC: SubGraphType = create_full_subgraph_async(identifying_number=3000)
 
 
 @dataclasses.dataclass
@@ -236,264 +350,544 @@ class RecursiveActionTracker(SyncTrackingClient):
         pass
 
 
-done = expr("(n == 1) or (n_count >= max_iterations)")
-is_even = expr("n % 2 == 0")
-is_odd = expr("n % 2 != 0")
-
-
-def build_collatz_graph(
-    divisor: int = 2,
-    multiplier: int = 3,
-    adder: int = 1,
-):
-    collatz_graph = (
-        GraphBuilder()
-        .with_actions(
-            start=start,
-            even=even.bind(divisor=divisor),
-            odd=odd.bind(multiplier=multiplier, adder=adder),
-            final=final,
-        )
-        .with_transitions(
-            (["start", "even"], "final", done),
-            (["start", "even", "odd"], "even", is_even),
-            (["start", "even", "odd"], "odd", is_odd),
-        )
-    ).build()
-    return RunnableGraph(collatz_graph, "start", ["final"])
-
-
-def build_async_collatz_graph(
-    divisor: int = 2,
-    multiplier: int = 3,
-    adder: int = 1,
-):
-    collatz_graph = (
-        GraphBuilder()
-        .with_actions(
-            start=astart,
-            even=aeven.bind(divisor=divisor),
-            odd=aodd.bind(multiplier=multiplier, adder=adder),
-            final=afinal,
-        )
-        .with_transitions(
-            (["start", "even"], "final", done),
-            (["start", "even", "odd"], "even", is_even),
-            (["start", "even", "odd"], "odd", is_odd),
-        )
-    ).build()
-    return RunnableGraph(collatz_graph, "start", ["final"])
+def _group_events_by_app_id(
+    events: List[RecursiveActionTracked],
+) -> Dict[str, List[RecursiveActionTracked]]:
+    grouped_events = {}
+    for event in events:
+        if event.app_id not in grouped_events:
+            grouped_events[event.app_id] = []
+        grouped_events[event.app_id].append(event)
+    return grouped_events
 
 
 def test_e2e_map_actions_sync_subgraph():
-    standard_collatz_graph = build_collatz_graph()
-    modified_collatz_graph = build_collatz_graph(
-        divisor=2, multiplier=5, adder=1
-    )  # probably doesn't converge...
-    second_modified_collatz_graph = build_collatz_graph(
-        divisor=2, multiplier=-1, adder=-3
-    )  # probably doesn't converge...
+    """Tests map actions over multiple action types (runnable graph, function, action class...)"""
 
-    class MapActionsCollatz(MapActions):
+    class MapActionsAllApproaches(MapActions):
         def actions(
             self, state: State, inputs: Dict[str, Any], context: ApplicationContext
         ) -> Generator[Union[Action, Callable, RunnableGraph], None, None]:
             for graph_ in [
-                standard_collatz_graph,
-                modified_collatz_graph,
-                second_modified_collatz_graph,
+                simple_single_fn_subgraph.bind(identifying_number=1000),
+                ClassBasedAction(2000),
+                create_full_subgraph(3000),
             ]:
                 yield graph_
 
         def state(self, state: State, inputs: Dict[str, Any]):
-            return state.update(max_iterations=100)
+            return state.update(input_number=state["input_number_in_state"], number_to_add=10)
 
         def reduce(self, state: State, states: Generator[State, None, None]) -> State:
             # TODO -- ensure that states is in the correct order...
             # Or decide to key it?
             new_state = state
             for output_state in states:
-                new_state = new_state.append(collatz_counts=output_state["n_count"])
+                new_state = new_state.append(output_numbers_in_state=output_state["output_number"])
             return new_state
 
         @property
         def writes(self) -> list[str]:
-            return ["collatz_counts"]
+            return ["output_numbers_in_state"]
 
         @property
         def reads(self) -> list[str]:
-            return ["n"]
+            return ["input_number_in_state"]
 
     app = (
         ApplicationBuilder()
         .with_actions(
-            initial_action=Input("n"),
-            map_action=MapActionsCollatz(),
-            final_action=Result("collatz_counts"),
+            initial_action=Input("input_number_in_state"),
+            map_action=MapActionsAllApproaches(),
+            final_action=Result("output_numbers_in_state"),
         )
         .with_transitions(("initial_action", "map_action"), ("map_action", "final_action"))
         .with_entrypoint("initial_action")
         .with_tracker(RecursiveActionTracker(events := []))
         .build()
     )
-    action, result, state = app.run(halt_after=["final_action"], inputs={"n": 1000})
-    print(events)
-    import pdb
-
-    pdb.set_trace()
+    action, result, state = app.run(
+        halt_after=["final_action"], inputs={"input_number_in_state": 100}
+    )
+    assert state["output_numbers_in_state"] == [1111, 2111, 3111]  # esnsure order correct
+    assert len(events) == 3  # three parent actions
+    _, map_event, __ = events
+    grouped_events = _group_events_by_app_id(map_event.children)
+    assert len(grouped_events) == 3  # three unique App IDs, one for each launching subgraph
 
 
 async def test_e2e_map_actions_async_subgraph():
-    standard_collatz_graph = build_async_collatz_graph()
-    modified_collatz_graph = build_async_collatz_graph(
-        divisor=2, multiplier=5, adder=1
-    )  # probably doesn't converge...
-    second_modified_collatz_graph = build_async_collatz_graph(
-        divisor=2, multiplier=-1, adder=-3
-    )  # probably doesn't converge...
+    """Tests map actions over multiple action types (runnable graph, function, action class...)"""
 
-    class MapActionsCollatz(MapActions):
+    class MapActionsAllApproachesAsync(MapActions):
         def actions(
             self, state: State, inputs: Dict[str, Any], context: ApplicationContext
         ) -> Generator[Union[Action, Callable, RunnableGraph], None, None]:
             for graph_ in [
-                standard_collatz_graph,
-                modified_collatz_graph,
-                second_modified_collatz_graph,
+                simple_single_fn_subgraph_async.bind(identifying_number=1000),
+                ClassBasedActionAsync(2000),
+                create_full_subgraph_async(3000),
             ]:
                 yield graph_
 
-        def state(self, state: State, inputs: Dict[str, Any]):
-            return state.update(max_iterations=state["n"])
+        def is_async(self) -> bool:
+            return True
 
-        def reduce(self, state: State, states: Generator[State, None, None]) -> State:
+        def state(self, state: State, inputs: Dict[str, Any]):
+            return state.update(input_number=state["input_number_in_state"], number_to_add=10)
+
+        async def reduce(self, state: State, states: AsyncGenerator[State, None]) -> State:
             # TODO -- ensure that states is in the correct order...
-            # Or deicde to key it?
+            # Or decide to key it?
             new_state = state
-            for output_state in states:
-                new_state = new_state.append(collatz_counts=output_state["n_count"])
+            async for output_state in states:
+                new_state = new_state.append(output_numbers_in_state=output_state["output_number"])
             return new_state
 
         @property
         def writes(self) -> list[str]:
-            return ["collatz_counts"]
+            return ["output_numbers_in_state"]
 
         @property
         def reads(self) -> list[str]:
-            return ["n"]
+            return ["input_number_in_state"]
 
     app = (
         ApplicationBuilder()
         .with_actions(
-            initial_action=Input("n"),
-            map_action=MapActionsCollatz(),
-            final_action=Result("collatz_counts"),
+            initial_action=Input("input_number_in_state"),
+            map_action=MapActionsAllApproachesAsync(),
+            final_action=Result("output_numbers_in_state"),
         )
         .with_transitions(("initial_action", "map_action"), ("map_action", "final_action"))
         .with_entrypoint("initial_action")
         .with_tracker(RecursiveActionTracker(events := []))
         .build()
     )
-    action, result, state = await app.arun(halt_after=["final_action"], inputs={"n": 1000})
-    print(events)
-    import pdb
+    action, result, state = await app.arun(
+        halt_after=["final_action"], inputs={"input_number_in_state": 100}
+    )
+    assert state["output_numbers_in_state"] == [1111, 2111, 3111]  # ensure order correct
+    assert len(events) == 3  # three parent actions
+    _, map_event, __ = events
+    grouped_events = _group_events_by_app_id(map_event.children)
+    assert len(grouped_events) == 3  # three unique App IDs, one for each launching subgraph
 
-    pdb.set_trace()
 
-
-def test_e2e_map_states_sync_subgraph():
+@pytest.mark.parametrize(
+    "action",
+    [
+        simple_single_fn_subgraph.bind(identifying_number=0),
+        ClassBasedAction(0),
+        create_full_subgraph(0),
+    ],
+)
+def test_e2e_map_states_sync_subgraph(action: SubGraphType):
     """Tests the map states action with a subgraph that is run in parallel.
     Collatz conjecture over different starting points"""
-    collatz_graph = build_collatz_graph()
 
-    class MapStatesCollatz(MapStates):
+    class MapStatesSync(MapStates):
         def states(
             self, state: State, context: ApplicationContext, inputs: Dict[str, Any]
         ) -> Generator[State, None, None]:
-            for n in [1, 2, 3, 4, 5, 6, 7, 8, 9, 10]:
-                yield state.update(n=n**3)  # cubed, why not
+            for input_number in state["input_numbers_in_state"]:
+                yield state.update(input_number=input_number, number_to_add=10)
 
-        def action(self, state: State, inputs: Dict[str, Any]) -> RunnableGraph:
-            return collatz_graph
+        def action(
+            self, state: State, inputs: Dict[str, Any]
+        ) -> Union[Action, Callable, RunnableGraph]:
+            return action
+
+        def is_async(self) -> bool:
+            return False
 
         def reduce(self, state: State, states: Generator[State, None, None]) -> State:
             # TODO -- ensure that states is in the correct order...
-            # Or deicde to key it?
-            for state in states:
-                state = state.append(collatz_counts=state["n_count"])
-            return state
+            # Or decide to key it?
+            new_state = state
+            for output_state in states:
+                new_state = new_state.append(output_numbers_in_state=output_state["output_number"])
+            return new_state
 
         @property
         def writes(self) -> list[str]:
-            return ["collatz_counts"]
+            return ["output_numbers_in_state"]
 
         @property
         def reads(self) -> list[str]:
-            return ["n"]
+            return ["input_numbers_in_state"]
 
     app = (
         ApplicationBuilder()
         .with_actions(
-            initial_action=Input("n"),
-            map_action=MapStatesCollatz(),
-            final_action=Result("collatz_counts"),
+            initial_action=Input("input_numbers_in_state"),
+            map_action=MapStatesSync(),
+            final_action=Result("output_numbers_in_state"),
         )
         .with_transitions(("initial_action", "map_action"), ("map_action", "final_action"))
         .with_entrypoint("initial_action")
         .with_tracker(RecursiveActionTracker(events := []))
         .build()
     )
-    action, result, state = app.run(halt_after=["final_action"])
-    print(events)
-    import pdb
+    action, result, state = app.run(
+        halt_after=["final_action"], inputs={"input_numbers_in_state": [100, 200, 300]}
+    )
+    assert state["output_numbers_in_state"] == [111, 211, 311]  # ensure order correct
+    assert len(events) == 3
+    _, map_event, __ = events
+    grouped_events = _group_events_by_app_id(map_event.children)
+    assert len(grouped_events) == 3
 
-    pdb.set_trace()
 
-
-async def test_e2e_map_states_async_subgraph():
+@pytest.mark.parametrize(
+    "action",
+    [
+        simple_single_fn_subgraph_async.bind(identifying_number=0),
+        ClassBasedActionAsync(0),
+        create_full_subgraph_async(0),
+    ],
+)
+async def test_e2e_map_states_async_subgraph(action: SubGraphType):
     """Tests the map states action with a subgraph that is run in parallel.
     Collatz conjecture over different starting points"""
-    collatz_graph = build_async_collatz_graph()
 
-    class MapStatesCollatz(MapStates):
+    class MapStatesAsync(MapStates):
         def states(
             self, state: State, context: ApplicationContext, inputs: Dict[str, Any]
         ) -> Generator[State, None, None]:
-            for n in [1, 2, 3, 4, 5, 6, 7, 8, 9, 10]:
-                yield state.update(n=n**3)  # cubed, why not
+            for input_number in state["input_numbers_in_state"]:
+                yield state.update(input_number=input_number, number_to_add=10)
 
-        def action(self, state: State, inputs: Dict[str, Any]) -> RunnableGraph:
-            return collatz_graph
+        def action(
+            self, state: State, inputs: Dict[str, Any]
+        ) -> Union[Action, Callable, RunnableGraph]:
+            return action
 
-        def reduce(self, state: State, states: Generator[State, None, None]) -> State:
+        def is_async(self) -> bool:
+            return True
+
+        async def reduce(self, state: State, states: AsyncGenerator[State, None]) -> State:
             # TODO -- ensure that states is in the correct order...
-            # Or deicde to key it?
-            for state in states:
-                state = state.append(collatz_counts=state["n_count"])
-            return state
+            # Or decide to key it?
+            new_state = state
+            async for output_state in states:
+                new_state = new_state.append(output_numbers_in_state=output_state["output_number"])
+            return new_state
 
         @property
         def writes(self) -> list[str]:
-            return ["collatz_counts"]
+            return ["output_numbers_in_state"]
 
         @property
         def reads(self) -> list[str]:
-            return ["n"]
+            return ["input_numbers_in_state"]
 
     app = (
         ApplicationBuilder()
         .with_actions(
-            initial_action=Input("n"),
-            map_action=MapStatesCollatz(),
-            final_action=Result("collatz_counts"),
+            initial_action=Input("input_numbers_in_state"),
+            map_action=MapStatesAsync(),
+            final_action=Result("output_numbers_in_state"),
         )
         .with_transitions(("initial_action", "map_action"), ("map_action", "final_action"))
         .with_entrypoint("initial_action")
         .with_tracker(RecursiveActionTracker(events := []))
         .build()
     )
-    action, result, state = await app.arun(halt_after=["final_action"])
-    print(events)
-    import pdb
+    action, result, state = await app.arun(
+        halt_after=["final_action"], inputs={"input_numbers_in_state": [100, 200, 300]}
+    )
+    assert state["output_numbers_in_state"] == [111, 211, 311]  # ensure order correct
+    assert len(events) == 3
+    _, map_event, __ = events
+    grouped_events = _group_events_by_app_id(map_event.children)
+    assert len(grouped_events) == 3
 
-    pdb.set_trace()
+
+def test_e2e_map_actions_and_states_sync():
+    """Tests the map states action with a subgraph that is run in parallel.
+    Collatz conjecture over different starting points"""
+
+    class MapStatesAsync(MapActionsAndStates):
+        def actions(
+            self, state: State, context: ApplicationContext, inputs: Dict[str, Any]
+        ) -> Generator[Union[Action, Callable, RunnableGraph], None, None]:
+            for graph_ in [
+                simple_single_fn_subgraph.bind(identifying_number=1000),
+                ClassBasedAction(2000),
+                create_full_subgraph(3000),
+            ]:
+                yield graph_
+
+        def states(
+            self, state: State, context: ApplicationContext, inputs: Dict[str, Any]
+        ) -> Generator[State, None, None]:
+            for input_number in state["input_numbers_in_state"]:
+                yield state.update(input_number=input_number, number_to_add=10)
+
+        def is_async(self) -> bool:
+            return False
+
+        def reduce(self, state: State, states: Generator[State, None, None]) -> State:
+            # TODO -- ensure that states is in the correct order...
+            # Or decide to key it?
+            new_state = state
+            for output_state in states:
+                new_state = new_state.append(output_numbers_in_state=output_state["output_number"])
+            return new_state
+
+        @property
+        def writes(self) -> list[str]:
+            return ["output_numbers_in_state"]
+
+        @property
+        def reads(self) -> list[str]:
+            return ["input_numbers_in_state"]
+
+    app = (
+        ApplicationBuilder()
+        .with_actions(
+            initial_action=Input("input_numbers_in_state"),
+            map_action=MapStatesAsync(),
+            final_action=Result("output_numbers_in_state"),
+        )
+        .with_transitions(("initial_action", "map_action"), ("map_action", "final_action"))
+        .with_entrypoint("initial_action")
+        .with_tracker(RecursiveActionTracker(events := []))
+        .build()
+    )
+    action, result, state = app.run(
+        halt_after=["final_action"], inputs={"input_numbers_in_state": [100, 200, 300]}
+    )
+    assert state["output_numbers_in_state"] == [
+        1111,
+        1211,
+        1311,
+        2111,
+        2211,
+        2311,
+        3111,
+        3211,
+        3311,
+    ]
+    assert len(events) == 3
+    _, map_event, __ = events
+    grouped_events = _group_events_by_app_id(map_event.children)
+    assert len(grouped_events) == 9  # cartesian product of 3 actions and 3 states
+
+
+async def test_e2e_map_actions_and_states_async():
+    """Tests the map states action with a subgraph that is run in parallel.
+    Collatz conjecture over different starting points"""
+
+    class MapStatesAsync(MapActionsAndStates):
+        def actions(
+            self, state: State, context: ApplicationContext, inputs: Dict[str, Any]
+        ) -> Generator[Union[Action, Callable, RunnableGraph], None, None]:
+            for graph_ in [
+                simple_single_fn_subgraph_async.bind(identifying_number=1000),
+                ClassBasedActionAsync(2000),
+                create_full_subgraph_async(3000),
+            ]:
+                yield graph_
+
+        def states(
+            self, state: State, context: ApplicationContext, inputs: Dict[str, Any]
+        ) -> AsyncGenerator[State, None]:
+            for input_number in state["input_numbers_in_state"]:
+                yield state.update(input_number=input_number, number_to_add=10)
+
+        def is_async(self) -> bool:
+            return True
+
+        async def reduce(self, state: State, states: AsyncGenerator[State, None]) -> State:
+            # TODO -- ensure that states is in the correct order...
+            # Or decide to key it?
+            new_state = state
+            async for output_state in states:
+                new_state = new_state.append(output_numbers_in_state=output_state["output_number"])
+            return new_state
+
+        @property
+        def writes(self) -> list[str]:
+            return ["output_numbers_in_state"]
+
+        @property
+        def reads(self) -> list[str]:
+            return ["input_numbers_in_state"]
+
+    app = (
+        ApplicationBuilder()
+        .with_actions(
+            initial_action=Input("input_numbers_in_state"),
+            map_action=MapStatesAsync(),
+            final_action=Result("output_numbers_in_state"),
+        )
+        .with_transitions(("initial_action", "map_action"), ("map_action", "final_action"))
+        .with_entrypoint("initial_action")
+        .with_tracker(RecursiveActionTracker(events := []))
+        .build()
+    )
+    action, result, state = await app.arun(
+        halt_after=["final_action"], inputs={"input_numbers_in_state": [100, 200, 300]}
+    )
+    assert state["output_numbers_in_state"] == [
+        1111,
+        1211,
+        1311,
+        2111,
+        2211,
+        2311,
+        3111,
+        3211,
+        3311,
+    ]
+    assert len(events) == 3
+    _, map_event, __ = events
+    grouped_events = _group_events_by_app_id(map_event.children)
+    assert len(grouped_events) == 9  # cartesian product of 3 actions and 3 states
+
+
+def test_task_level_API_e2e_sync():
+    """Tests the map states action with a subgraph that is run in parallel.
+    Collatz conjecture over different starting points"""
+
+    class TaskBasedAction(TaskBasedParallelAction):
+        def tasks(
+            self, state: State, context: ApplicationContext, inputs: Dict[str, Any]
+        ) -> Generator[SubGraphTask, None, None]:
+            for j, action in enumerate(
+                [
+                    simple_single_fn_subgraph.bind(identifying_number=1000),
+                    ClassBasedAction(2000),
+                    create_full_subgraph(3000),
+                ]
+            ):
+                for i, input_number in enumerate(state["input_numbers_in_state"]):
+                    yield SubGraphTask(
+                        graph=RunnableGraph.create(action),
+                        inputs={},
+                        state=state.update(input_number=input_number, number_to_add=10),
+                        application_id=f"{i}_{j}",
+                    )
+
+        def reduce(self, state: State, states: Generator[State, None, None]) -> State:
+            # TODO -- ensure that states is in the correct order...
+            # Or decide to key it?
+            new_state = state
+            for output_state in states:
+                new_state = new_state.append(output_numbers_in_state=output_state["output_number"])
+            return new_state
+
+        @property
+        def writes(self) -> list[str]:
+            return ["output_numbers_in_state"]
+
+        @property
+        def reads(self) -> list[str]:
+            return ["input_numbers_in_state"]
+
+    app = (
+        ApplicationBuilder()
+        .with_actions(
+            initial_action=Input("input_numbers_in_state"),
+            map_action=TaskBasedAction(),
+            final_action=Result("output_numbers_in_state"),
+        )
+        .with_transitions(("initial_action", "map_action"), ("map_action", "final_action"))
+        .with_entrypoint("initial_action")
+        .with_tracker(RecursiveActionTracker(events := []))
+        .build()
+    )
+    action, result, state = app.run(
+        halt_after=["final_action"], inputs={"input_numbers_in_state": [100, 200, 300]}
+    )
+    assert state["output_numbers_in_state"] == [
+        1111,
+        1211,
+        1311,
+        2111,
+        2211,
+        2311,
+        3111,
+        3211,
+        3311,
+    ]
+    assert len(events) == 3
+    _, map_event, __ = events
+    grouped_events = _group_events_by_app_id(map_event.children)
+    assert len(grouped_events) == 9  # cartesian product of 3 actions and 3 states
+
+
+async def test_task_level_API_e2e_async():
+    """Tests the map states action with a subgraph that is run in parallel.
+    Collatz conjecture over different starting points"""
+
+    class TaskBasedActionAsync(TaskBasedParallelAction):
+        async def tasks(
+            self, state: State, context: ApplicationContext, inputs: Dict[str, Any]
+        ) -> AsyncGenerator[SubGraphTask, None]:
+            for j, action in enumerate(
+                [
+                    simple_single_fn_subgraph.bind(identifying_number=1000),
+                    ClassBasedAction(2000),
+                    create_full_subgraph(3000),
+                ]
+            ):
+                for i, input_number in enumerate(state["input_numbers_in_state"]):
+                    yield SubGraphTask(
+                        graph=RunnableGraph.create(action),
+                        inputs={},
+                        state=state.update(input_number=input_number, number_to_add=10),
+                        application_id=f"{i}_{j}",
+                    )
+
+        async def reduce(self, state: State, states: AsyncGenerator[State, None]) -> State:
+            # TODO -- ensure that states is in the correct order...
+            # Or decide to key it?
+            new_state = state
+            async for output_state in states:
+                new_state = new_state.append(output_numbers_in_state=output_state["output_number"])
+            return new_state
+
+        @property
+        def writes(self) -> list[str]:
+            return ["output_numbers_in_state"]
+
+        @property
+        def reads(self) -> list[str]:
+            return ["input_numbers_in_state"]
+
+        def is_async(self) -> bool:
+            return True
+
+    app = (
+        ApplicationBuilder()
+        .with_actions(
+            initial_action=Input("input_numbers_in_state"),
+            map_action=TaskBasedActionAsync(),
+            final_action=Result("output_numbers_in_state"),
+        )
+        .with_transitions(("initial_action", "map_action"), ("map_action", "final_action"))
+        .with_entrypoint("initial_action")
+        .with_tracker(RecursiveActionTracker(events := []))
+        .build()
+    )
+    action, result, state = await app.arun(
+        halt_after=["final_action"], inputs={"input_numbers_in_state": [100, 200, 300]}
+    )
+    assert state["output_numbers_in_state"] == [
+        1111,
+        1211,
+        1311,
+        2111,
+        2211,
+        2311,
+        3111,
+        3211,
+        3311,
+    ]
+    assert len(events) == 3
+    _, map_event, __ = events
+    grouped_events = _group_events_by_app_id(map_event.children)
+    assert len(grouped_events) == 9  # cartesian product of 3 actions and 3 states

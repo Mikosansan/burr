@@ -862,7 +862,7 @@ class Application(Generic[ApplicationStateType]):
                 BASE_ERROR_MESSAGE
                 + f"Inputs starting with a double underscore ({starting_with_double_underscore}) "
                 f"are reserved for internal use/injected inputs."
-                "Please do not use keys"
+                "Please do not directly pass keys starting with a double underscore."
             )
         inputs = inputs.copy()
         processed_inputs = {}

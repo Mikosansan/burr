@@ -1,5 +1,8 @@
 import abc
+import asyncio
 import dataclasses
+import inspect
+from concurrent.futures import ThreadPoolExecutor
 from typing import Any, Callable, Dict, Generator, List, Tuple, Union
 
 from burr.core import Action, Application, ApplicationBuilder, ApplicationContext, Graph, State
@@ -58,6 +61,11 @@ class SubGraphTask:
                 partition_key=parent_context.partition_key,
             )
             .with_tracker(parent_context.tracker.copy())  # We have to copy
+            # TODO -- handle persistence...
+            .with_identifiers(
+                app_id=self.application_id,
+                partition_key=parent_context.partition_key,  # cascade the partition key
+            )
             .build()
         )
 
@@ -101,20 +109,60 @@ class TaskBasedParallelAction(SingleStepAction):
         :param run_kwargs:
         :return:
         """
-        context: ApplicationContext = run_kwargs.get("__context")
-        if context is None:
-            raise ValueError("This action requires a context to run")
-        state_without_internals = state.wipe(
-            delete=[item for item in state.keys() if item.startswith("__")]
-        )
-        task_generator = self.tasks(state_without_internals, context, run_kwargs)
 
-        # TODO -- run in parallel
-        def state_generator():
-            for task in task_generator:
-                yield task.run(run_kwargs["__context"])
+        def _run_and_update():
+            context: ApplicationContext = run_kwargs.get("__context")
+            if context is None:
+                raise ValueError("This action requires a context to run")
+            state_without_internals = state.wipe(
+                delete=[item for item in state.keys() if item.startswith("__")]
+            )
+            task_generator = self.tasks(state_without_internals, context, run_kwargs)
 
-        return {}, self.reduce(state_without_internals, state_generator())
+            def execute_task(task):
+                return task.run(run_kwargs["__context"])
+
+            # TODO -- take the threadpool executor out and make it generic
+            with ThreadPoolExecutor() as executor:
+                # Directly map the generator to the executor
+                results = list(executor.map(execute_task, task_generator))
+
+            def state_generator() -> Generator[Any, None, None]:
+                yield from results
+
+            return {}, self.reduce(state_without_internals, state_generator())
+
+        async def _arun_and_update():
+            context: ApplicationContext = run_kwargs.get("__context")
+            if context is None:
+                raise ValueError("This action requires a context to run")
+            state_without_internals = state.wipe(
+                delete=[item for item in state.keys() if item.startswith("__")]
+            )
+            task_generator = self.tasks(state_without_internals, context, run_kwargs)
+
+            # TODO -- run in parallel
+            async def state_generator():
+                """This makes it easier on the user -- if they don't have an async generator we can still exhause it
+                This way we run through all of the task generators. These correspond to the task generation capabilities above (the map*/task generation stuff)
+                """
+                if inspect.isasyncgen(task_generator):
+                    coroutines = [task.arun(context) async for task in task_generator]
+                else:
+                    coroutines = [task.arun(context) for task in task_generator]
+                results = await asyncio.gather(*coroutines)
+                # TODO -- yield in order...
+                for result in results:
+                    yield result
+
+            return {}, await self.reduce(state_without_internals, state_generator())
+
+        if self.is_async():
+            return _arun_and_update()  # type: ignore
+        return _run_and_update()
+
+    def is_async(self) -> bool:
+        return False
 
     @property
     def inputs(self) -> Union[list[str], tuple[list[str], list[str]]]:
@@ -288,8 +336,7 @@ class MapStates(MapActionsAndStates, abc.ABC):
         :param inputs:
         :return:
         """
-        for sub_state in self.states(state, context, inputs):
-            yield self.action(sub_state, inputs)
+        yield self.action(state, inputs)
 
     @abc.abstractmethod
     def reduce(self, state: State, results: Generator[State, None, None]) -> State:
