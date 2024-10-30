@@ -24,6 +24,7 @@ from burr.core.parallelism import (
     RunnableGraph,
     SubGraphTask,
     TaskBasedParallelAction,
+    map_reduce_action,
 )
 from burr.tracking.base import SyncTrackingClient
 from burr.visibility import ActionSpan
@@ -874,6 +875,57 @@ async def test_task_level_API_e2e_async():
         .build()
     )
     action, result, state = await app.arun(
+        halt_after=["final_action"], inputs={"input_numbers_in_state": [100, 200, 300]}
+    )
+    assert state["output_numbers_in_state"] == [
+        1111,
+        1211,
+        1311,
+        2111,
+        2211,
+        2311,
+        3111,
+        3211,
+        3311,
+    ]
+    assert len(events) == 3
+    _, map_event, __ = events
+    grouped_events = _group_events_by_app_id(map_event.children)
+    assert len(grouped_events) == 9  # cartesian product of 3 actions and 3 states
+
+
+def test_map_reduce_function_e2e():
+    mre = map_reduce_action(
+        action=[
+            simple_single_fn_subgraph.bind(identifying_number=1000),
+            ClassBasedAction(2000),
+            create_full_subgraph(3000),
+        ],
+        reads=["input_numbers_in_state"],
+        writes=["output_numbers_in_state"],
+        state=lambda state, context, inputs: (
+            state.update(input_number=input_number, number_to_add=10)
+            for input_number in state["input_numbers_in_state"]
+        ),
+        inputs=[],
+        reducer=lambda state, states: state.extend(
+            output_numbers_in_state=[output_state["output_number"] for output_state in states]
+        ),
+    )
+
+    app = (
+        ApplicationBuilder()
+        .with_actions(
+            initial_action=Input("input_numbers_in_state"),
+            map_action=mre,
+            final_action=Result("output_numbers_in_state"),
+        )
+        .with_transitions(("initial_action", "map_action"), ("map_action", "final_action"))
+        .with_entrypoint("initial_action")
+        .with_tracker(RecursiveActionTracker(events := []))
+        .build()
+    )
+    action, result, state = app.run(
         halt_after=["final_action"], inputs={"input_numbers_in_state": [100, 200, 300]}
     )
     assert state["output_numbers_in_state"] == [

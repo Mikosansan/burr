@@ -1,3 +1,4 @@
+from concurrent.futures import ProcessPoolExecutor
 from typing import Any, Callable, Dict, Generator, List, Tuple, Union
 
 import openai
@@ -207,6 +208,7 @@ def application() -> Application:
         )
         .with_tracker(project="demo:parallelism_poem_generation")
         .with_entrypoint("user_input")
+        .with_parallel_executor(ProcessPoolExecutor(max_workers=-1))
         .build()
     )
 
